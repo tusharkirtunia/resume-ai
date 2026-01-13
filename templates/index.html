@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Resume Editor</title>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 24px;
+      max-width: 900px;
+      margin: auto;
+      background: #fafafa;
+    }
+
+    h1, h3 {
+      margin-bottom: 12px;
+    }
+
+    label {
+      font-weight: bold;
+    }
+
+    input[type="text"] {
+      width: 100%;
+      padding: 6px;
+      margin-top: 4px;
+      box-sizing: border-box;
+    }
+
+    select {
+      padding: 6px;
+      margin-top: 6px;
+    }
+
+    .exp {
+      margin-top: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid #ddd;
+    }
+
+    .bullet {
+      display: flex;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .bullet input {
+      flex: 1;
+    }
+
+    button {
+      padding: 6px 12px;
+      cursor: pointer;
+      border: 1px solid #333;
+      background: #fff;
+    }
+
+    button:hover {
+      background: #eee;
+    }
+
+    .actions {
+      margin-top: 24px;
+    }
+  </style>
+</head>
+
+<body>
+
+  <h1>Resume Editor</h1>
+
+  <h3>Resume Variant</h3>
+  <select id="variantSelect" onchange="activateVariant()"></select>
+
+  <hr />
+
+  <label>
+    Job Description
+    <input
+      id="job"
+      type="text"
+      value="Backend API role"
+    />
+  </label>
+
+  <div id="resume"></div>
+
+  <div class="actions">
+    <button onclick="save()">Save Resume</button>
+  </div>
+
+  <script>
+    let resume = null;
+    let variants = [];
+    let activeVariant = null;
+
+    // ---------- LOAD VARIANTS ----------
+    async function loadVariants() {
+      const res = await fetch("/api/variants");
+      const data = await res.json();
+
+      variants = data.variants;
+      activeVariant = data.active;
+
+      const select = document.getElementById("variantSelect");
+      select.innerHTML = "";
+
+      variants.forEach(v => {
+        const opt = document.createElement("option");
+        opt.value = v;
+        opt.textContent = v;
+        if (v === activeVariant) opt.selected = true;
+        select.appendChild(opt);
+      });
+    }
+
+    // ---------- ACTIVATE VARIANT ----------
+    async function activateVariant() {
+      const name = document.getElementById("variantSelect").value;
+
+      await fetch("/api/variant/activate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name })
+      });
+
+      await loadResume();
+    }
+
+    // ---------- LOAD RESUME ----------
+    async function loadResume() {
+      await loadVariants();
+      const res = await fetch("/api/resume");
+      resume = await res.json();
+      render();
+    }
+
+    // ---------- RENDER ----------
+    function render() {
+      const root = document.getElementById("resume");
+      root.innerHTML = "";
+
+      resume.experience.forEach((exp, expIndex) => {
+        const expDiv = document.createElement("div");
+        expDiv.className = "exp";
+
+        const title = document.createElement("h3");
+        title.textContent = `${exp.role} @ ${exp.company}`;
+        expDiv.appendChild(title);
+
+        exp.bullets.forEach((bullet, bulletIndex) => {
+          const row = document.createElement("div");
+          row.className = "bullet";
+
+          const input = document.createElement("input");
+          input.type = "text";
+          input.value = bullet;
+          input.oninput = e => {
+            resume.experience[expIndex].bullets[bulletIndex] =
+              e.target.value;
+          };
+
+          const btn = document.createElement("button");
+          btn.textContent = "Rewrite";
+          btn.onclick = () =>
+            rewriteBullet(expIndex, bulletIndex);
+
+          row.appendChild(input);
+          row.appendChild(btn);
+          expDiv.appendChild(row);
+        });
+
+        root.appendChild(expDiv);
+      });
+    }
+
+    // ---------- REWRITE BULLET ----------
+    async function rewriteBullet(expIndex, bulletIndex) {
+      const bullet =
+        resume.experience[expIndex].bullets[bulletIndex];
+      const job = document.getElementById("job").value;
+
+      const res = await fetch("/api/rewrite", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bullet, job })
+      });
+
+      const data = await res.json();
+      const rewritten = data.rewritten;
+
+      resume.experience[expIndex].bullets[bulletIndex] =
+        rewritten;
+
+      await fetch("/api/resume/bullet", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          exp_index: expIndex,
+          bullet_index: bulletIndex,
+          text: rewritten
+        })
+      });
+
+      render();
+    }
+
+    // ---------- SAVE FULL RESUME ----------
+    async function save() {
+      await fetch("/api/resume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(resume)
+      });
+
+      alert("Resume saved");
+    }
+
+    loadResume();
+  </script>
+
+</body>
+</html>
