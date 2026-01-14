@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Resume Editor + AI Rewrite</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 900px;
+      margin: 40px auto;
+    }
+    textarea, input, select {
+      width: 100%;
+      margin-top: 6px;
+      margin-bottom: 12px;
+      padding: 8px;
+    }
+    button {
+      padding: 8px 14px;
+      margin-right: 10px;
+      cursor: pointer;
+    }
+    .bullet {
+      border: 1px solid #ccc;
+      padding: 12px;
+      margin-bottom: 14px;
+    }
+    .rewritten {
+      background: #f4f4f4;
+      padding: 10px;
+      margin-top: 8px;
+      min-height: 20px;
+    }
+    .variant-select {
+      margin-bottom: 16px;
+    }
+    .variant-label {
+      font-weight: bold;
+      margin-right: 8px;
+    }
+  </style>
+</head>
+<body>
+
+<h1>Resume Editor + AI Rewrite</h1>
+
+<label>
+  Job description (used for rewrite):
+  <textarea id="job" rows="3">Backend API role</textarea>
+</label>
+
+<div class="variant-select">
+  <span class="variant-label">Variant:</span>
+  <select id="variant" onchange="onVariantChange()">
+    <option value="default">Default</option>
+    <option value="concise">Concise</option>
+    <option value="detailed">Detailed</option>
+    <option value="impactful">Impactful</option>
+  </select>
+</div>
+
+<div id="resume"></div>
+
+<script>
+let resumeData = null
+let selectedVariant = "default"
+
+async function loadResume() {
+  const res = await fetch("/api/resume")
+  if (!res.ok) {
+    alert("Failed to load resume")
+    return
+  }
+  resumeData = await res.json()
+  renderResume()
+}
+
+function renderResume() {
+  const container = document.getElementById("resume")
+  container.innerHTML = ""
+
+  resumeData.experience.forEach((exp, expIndex) => {
+    exp.bullets.forEach((bullet, bulletIndex) => {
+      const div = document.createElement("div")
+      div.className = "bullet"
+      div.innerHTML = `
+        <strong>${exp.role} @ ${exp.company}</strong><br><br>
+        <textarea id="bullet-${expIndex}-${bulletIndex}">${bullet}</textarea>
+        <button onclick="rewrite(${expIndex}, ${bulletIndex})">
+          Rewrite
+        </button>
+        <button onclick="applyRewrite(${expIndex}, ${bulletIndex})">
+          Apply Rewrite
+        </button>
+        <div id="rewritten-${expIndex}-${bulletIndex}" class="rewritten"></div>
+      `
+      container.appendChild(div)
+    })
+  })
+}
+
+async function rewrite(expIndex, bulletIndex) {
+  const bullet = document.getElementById(
+    `bullet-${expIndex}-${bulletIndex}`
+  ).value
+  const job = document.getElementById("job").value
+
+  const variant = selectedVariant
+
+  const res = await fetch("/api/rewrite", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ bullet, job, variant })
+  })
+
+  if (!res.ok) {
+    alert("Rewrite failed")
+    return
+  }
+
+  const data = await res.json()
+
+  document.getElementById(
+    `rewritten-${expIndex}-${bulletIndex}`
+  ).innerText = data.rewritten
+}
+
+async function applyRewrite(expIndex, bulletIndex) {
+  const rewritten = document.getElementById(
+    `rewritten-${expIndex}-${bulletIndex}`
+  ).innerText
+
+  if (!rewritten) {
+    alert("Rewrite first")
+    return
+  }
+
+  const res = await fetch("/api/resume/bullet", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      exp_index: expIndex,
+      bullet_index: bulletIndex,
+      text: rewritten
+    })
+  })
+
+  if (!res.ok) {
+    alert("Save failed")
+    return
+  }
+
+  await loadResume()
+}
+
+function onVariantChange() {
+  selectedVariant = document.getElementById("variant").value
+}
+
+loadResume()
+</script>
+
+</body>
+</html>
