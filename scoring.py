@@ -1,102 +1,102 @@
-import copy
-import math
-from rank_bm25 import BM25Okapi
-from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+import re
+from collections import Counter
 
+# -----------------------------
+# CONFIG
+# -----------------------------
 
-# ---------------------------------------------------------
-# TEXT NORMALIZATION
-# ---------------------------------------------------------
+STOPWORDS = {
+    "the", "and", "to", "of", "a", "in", "for", "with", "on", "by",
+    "is", "as", "at", "an", "be", "this", "that"
+}
 
-def normalize_text(text: str) -> list[str]:
-    return [
-        w.lower()
-        for w in text.split()
-        if w.isalpha() and w.lower() not in ENGLISH_STOP_WORDS
-    ]
+BOOST_KEYWORDS = {
+    "api", "apis", "backend", "performance", "latency",
+    "scalable", "scalability", "design", "engineer",
+    "system", "distributed", "service", "services"
+}
 
+ACTION_VERBS = {
+    "built", "designed", "implemented", "optimized",
+    "developed", "created", "improved", "led"
+}
 
-# ---------------------------------------------------------
-# RESUME VALIDATION (PURE)
-# ---------------------------------------------------------
+# -----------------------------
+# UTILITIES
+# -----------------------------
 
-def validate_resume_shape(resume: dict):
-    if not isinstance(resume, dict):
-        raise ValueError("Resume must be a dict")
+def tokenize(text: str):
+    words = re.findall(r"[a-zA-Z]+", text.lower())
+    return [w for w in words if w not in STOPWORDS]
 
-    experience = resume.get("experience", [])
-    if not isinstance(experience, list):
-        raise ValueError("experience must be a list")
+def normalize_score(value, max_value):
+    if max_value == 0:
+        return 0.0
+    return min(value / max_value, 1.0)
 
-    for exp in experience:
-        bullets = exp.get("bullets", [])
-        if not isinstance(bullets, list):
-            raise ValueError("bullets must be a list")
-        for b in bullets:
-            if not isinstance(b, str):
-                raise ValueError("bullet must be a string")
-
-
-# ---------------------------------------------------------
-# CORE SCORING (PURE, IMMUTABLE)
-# ---------------------------------------------------------
+# -----------------------------
+# CORE SCORING
+# -----------------------------
 
 def score_resume(resume: dict, job: str) -> float:
-    validate_resume_shape(resume)
-
-    job_tokens = normalize_text(job)
+    job_tokens = tokenize(job)
     if not job_tokens:
         return 0.0
 
-    bullets = []
-    for exp in resume.get("experience", []):
-        bullets.extend(exp.get("bullets", []))
+    job_counts = Counter(job_tokens)
+    total_score = 0.0
+    bullets_seen = 0
 
-    bullet_tokens = [normalize_text(b) for b in bullets if b.strip()]
+    for exp in resume.get("experience", []):
+        for bullet in exp.get("bullets", []):
+            score = score_bullet(bullet, job_counts)
+            total_score += score
+            bullets_seen += 1
+
+    if bullets_seen == 0:
+        return 0.0
+
+    return normalize_score(total_score, bullets_seen)
+
+def score_bullet(bullet: str, job_counts: Counter) -> float:
+    bullet_tokens = tokenize(bullet)
     if not bullet_tokens:
         return 0.0
 
-    bm25 = BM25Okapi(bullet_tokens)
-    scores = bm25.get_scores(job_tokens)
+    bullet_counts = Counter(bullet_tokens)
 
-    if not scores.any():
-        return 0.0
+    # Base overlap
+    overlap = sum(
+        min(bullet_counts[t], job_counts.get(t, 0))
+        for t in bullet_counts
+    )
 
-    return float(scores.mean())
+    # Keyword boosts
+    boost = sum(1 for t in bullet_tokens if t in BOOST_KEYWORDS)
+    action_boost = sum(1 for t in bullet_tokens if t in ACTION_VERBS)
 
+    raw_score = overlap + (0.5 * boost) + (0.3 * action_boost)
 
-# ---------------------------------------------------------
-# BULLET-LEVEL IMPACT (PURE)
-# ---------------------------------------------------------
+    return normalize_score(raw_score, len(bullet_tokens))
+
+# -----------------------------
+# BULLET IMPACT
+# -----------------------------
 
 def bullet_impact_scores(resume: dict, job: str):
-    validate_resume_shape(resume)
-
-    job_tokens = normalize_text(job)
-    if not job_tokens:
-        return []
+    job_tokens = tokenize(job)
+    job_counts = Counter(job_tokens)
 
     impacts = []
 
     for exp_i, exp in enumerate(resume.get("experience", [])):
-        bullets = exp.get("bullets", [])
-        tokenized = [normalize_text(b) for b in bullets if b.strip()]
-
-        if not tokenized:
-            continue
-
-        bm25 = BM25Okapi(tokenized)
-        scores = bm25.get_scores(job_tokens)
-
-        for b_i, (bullet, score) in enumerate(zip(bullets, scores)):
-            if not bullet.strip():
-                continue
-
+        for b_i, bullet in enumerate(exp.get("bullets", [])):
+            impact = score_bullet(bullet, job_counts)
             impacts.append({
                 "experience_index": exp_i,
                 "bullet_index": b_i,
                 "bullet": bullet,
-                "impact": float(score)
+                "impact": impact
             })
 
     return impacts

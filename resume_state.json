@@ -1,10 +1,25 @@
 {
-  "active_variant": "base",
+  "active_variant": "backend-role",
   "variants": {
     "base": {
       "id": "base",
       "summary": "Backend developer",
       "experience": []
+    },
+    "backend-role": {
+      "id": "backend-role",
+      "summary": "Backend developer",
+      "experience": [
+        {
+          "id": "exp_0",
+          "company": "Example Corp",
+          "role": "Backend Engineer",
+          "bullets": [
+            "Designed and implemented REST APIs serving 1M+ requests per day with sub-200ms latency",
+            "Optimized backend services and API latency by 40% through caching and query tuning"
+          ]
+        }
+      ]
     }
   }
 }

@@ -60,6 +60,26 @@ validate_state_or_die(state)
 # VALIDATION HELPERS
 # ---------------------------------------------------------
 
+def normalize_resume(payload):
+    resume = {
+        "id": payload.get("id", state["active_variant"]),
+        "summary": payload.get("summary", ""),
+        "experience": []
+    }
+
+    for i, exp in enumerate(payload.get("experience", [])):
+        resume["experience"].append({
+            "id": exp.get("id", f"exp_{i}"),
+            "company": exp.get("company", ""),
+            "role": exp.get("role", ""),
+            "bullets": [
+                b for b in exp.get("bullets", [])
+                if isinstance(b, str) and b.strip()
+            ]
+        })
+
+    return resume
+
 def validate_resume(resume):
     if not isinstance(resume, dict):
         return False
@@ -166,10 +186,13 @@ def save_resume_api():
         return guard
 
     payload = request.get_json()
-    if not validate_resume(payload):
+    if not isinstance(payload, dict):
         return jsonify({"error": "Invalid resume"}), 400
 
-    state["variants"][state["active_variant"]] = payload
+    normalized = normalize_resume(payload)
+    guard_resume_size(normalized)
+
+    state["variants"][state["active_variant"]] = normalized
     save_state(state)
     return jsonify({"status": "saved"})
 
