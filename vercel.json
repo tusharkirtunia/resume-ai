@@ -7,5 +7,6 @@
         "distDir": "frontend/resume-ui/dist"
       }
     }
-  ]
+  ],
+  "outputDirectory": "frontend/resume-ui/dist"
 }
