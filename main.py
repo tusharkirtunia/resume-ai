@@ -1,23 +1,87 @@
 from flask import Flask, jsonify, request
+import json
+import statistics
+
 from storage import load_state, save_state
 from state import initial_state
 from editor import update_bullet
-from rewriter import rewrite_bullet
-from scoring import score_resume
-import json
+from scoring import score_resume, bullet_impact_scores
+from metrics import MetricsStore
+from metrics_aggregator import load_metrics, aggregate_metrics
+import sys
+import os
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 app = Flask(__name__)
+metrics = MetricsStore()
 
 # =========================================================
-# STATE INITIALIZATION
+# STATE
 # =========================================================
 
 state = load_state() or initial_state()
 
+def validate_state_or_die(state: dict):
+    if not isinstance(state, dict):
+        raise RuntimeError("State is not a dict")
+
+    if "active_variant" not in state:
+        raise RuntimeError("active_variant missing")
+
+    if "variants" not in state or not isinstance(state["variants"], dict):
+        raise RuntimeError("variants missing or invalid")
+
+    if "base" not in state["variants"]:
+        raise RuntimeError("base variant missing")
+
+    active = state["active_variant"]
+    if active not in state["variants"]:
+        raise RuntimeError(f"active_variant '{active}' not found")
+
+    for name, resume in state["variants"].items():
+        if not isinstance(resume, dict):
+            raise RuntimeError(f"Variant '{name}' is not a dict")
+
+        exp = resume.get("experience")
+        if not isinstance(exp, list):
+            raise RuntimeError(f"Variant '{name}': experience must be list")
+
+        for i, e in enumerate(exp):
+            bullets = e.get("bullets")
+            if not isinstance(bullets, list):
+                raise RuntimeError(f"{name}.experience[{i}].bullets must be list")
+            if not all(isinstance(b, str) and b.strip() for b in bullets):
+                raise RuntimeError(f"{name}.experience[{i}].bullets invalid")
+
+validate_state_or_die(state)
+
+def validate_resume(resume):
+    if not isinstance(resume, dict):
+        return False
+
+    experience = resume.get("experience")
+    if not isinstance(experience, list):
+        return False
+
+    for exp in experience:
+        if not isinstance(exp, dict):
+            return False
+        bullets = exp.get("bullets")
+        if not isinstance(bullets, list):
+            return False
+        if not all(isinstance(b, str) for b in bullets):
+            return False
+
+    return True
+
+for name, resume in state["variants"].items():
+    if not validate_resume(resume):
+        raise RuntimeError(f"Invalid resume structure in variant '{name}'")
+
 
 def get_active_resume():
-    active = state["active_variant"]
-    return state["variants"][active]
+    return state["variants"][state["active_variant"]]
 
 
 def ensure_not_base():
@@ -27,9 +91,89 @@ def ensure_not_base():
         }), 403
     return None
 
+def is_dry_run(payload):
+    return payload.get("dry_run", False) is True
+
 
 # =========================================================
-# HEALTH CHECK
+# BULLET DECISION LOGIC (PHASE 28.x)
+# =========================================================
+
+def make_bullet_decisions(impacts):
+    scores = [i["impact"] for i in impacts]
+    if not scores:
+        return []
+
+    mean = statistics.mean(scores)
+    std = statistics.pstdev(scores) if len(scores) > 1 else 0.0
+
+    high = mean + 0.5 * std
+    low = mean - 0.5 * std
+
+    decisions = []
+
+    for item in impacts:
+        impact = item["impact"]
+
+        if impact >= high:
+            action = "KEEP"
+        elif impact <= low:
+            action = "REMOVE"
+        else:
+            action = "REVIEW"
+
+        decisions.append({
+            "experience_index": item["experience_index"],
+            "bullet_index": item["bullet_index"],
+            "bullet": item["bullet"],
+            "impact": impact,
+            "action": action
+        })
+
+    return decisions
+
+
+# =========================================================
+# PHASE 29.1 — DRY-RUN EXECUTION PLAN
+# =========================================================
+
+def build_execution_plan(decisions):
+    plan = {
+        "KEEP": [],
+        "REVIEW": [],
+        "REMOVE": []
+    }
+
+    for d in decisions:
+        plan[d["action"]].append(d)
+
+    return plan
+
+
+# =========================================================
+# BULLET REMOVAL HELPER
+# =========================================================
+
+def apply_removals(resume, decisions):
+    updated = json.loads(json.dumps(resume))
+    removals = [
+        d for d in decisions if d["action"] == "REMOVE"
+    ]
+
+    for d in sorted(removals, key=lambda x: (x["experience_index"], x["bullet_index"]), reverse=True):
+        exp_i = d["experience_index"]
+        b_i = d["bullet_index"]
+
+        try:
+            updated["experience"][exp_i]["bullets"].pop(b_i)
+        except (IndexError, KeyError):
+            continue
+
+    return updated
+
+
+# =========================================================
+# HEALTH
 # =========================================================
 
 @app.route("/")
@@ -38,17 +182,13 @@ def home():
 
 
 # =========================================================
-# RESUME READ
+# RESUME
 # =========================================================
 
 @app.route("/api/resume", methods=["GET"])
 def get_resume():
     return jsonify(get_active_resume())
 
-
-# =========================================================
-# RESUME SAVE
-# =========================================================
 
 @app.route("/api/resume", methods=["POST"])
 def save_resume_api():
@@ -60,16 +200,13 @@ def save_resume_api():
     if not isinstance(payload, dict):
         return jsonify({"error": "Invalid payload"}), 400
 
-    active = state["active_variant"]
-    state["variants"][active] = payload
-    save_state(state)
+    if not validate_resume(payload):
+        return jsonify({"error": "Invalid resume structure"}), 400
 
+    state["variants"][state["active_variant"]] = payload
+    save_state(state)
     return jsonify({"status": "saved"})
 
-
-# =========================================================
-# BULLET UPDATE
-# =========================================================
 
 @app.route("/api/resume/bullet", methods=["POST"])
 def update_bullet_api():
@@ -82,45 +219,27 @@ def update_bullet_api():
     bullet_index = payload.get("bullet_index")
     text = payload.get("text")
 
-    if not all([
-        isinstance(exp_index, int),
-        isinstance(bullet_index, int),
-        isinstance(text, str)
-    ]):
+    if not all(isinstance(x, int) for x in [exp_index, bullet_index]) or not isinstance(text, str) or not text.strip():
         return jsonify({"error": "Invalid input"}), 400
 
     resume = get_active_resume()
+    try:
+        resume["experience"][exp_index]["bullets"][bullet_index]
+    except (IndexError, KeyError, TypeError):
+        return jsonify({"error": "Index out of range"}), 400
+
     updated = update_bullet(resume, exp_index, bullet_index, text)
 
     if updated is None:
         return jsonify({"error": "Update failed"}), 400
 
-    active = state["active_variant"]
-    state["variants"][active] = updated
+    state["variants"][state["active_variant"]] = updated
     save_state(state)
-
     return jsonify({"status": "updated"})
 
 
 # =========================================================
-# BULLET REWRITE
-# =========================================================
-
-@app.route("/api/rewrite", methods=["POST"])
-def rewrite_api():
-    payload = request.get_json()
-    bullet = payload.get("bullet")
-    job = payload.get("job")
-
-    if not isinstance(bullet, str) or not isinstance(job, str):
-        return jsonify({"error": "Invalid input"}), 400
-
-    rewritten = rewrite_bullet(bullet, job)
-    return jsonify({"rewritten": rewritten})
-
-
-# =========================================================
-# VARIANT CREATE / ACTIVATE / LIST
+# VARIANTS
 # =========================================================
 
 @app.route("/api/variant", methods=["POST"])
@@ -131,10 +250,8 @@ def create_variant():
     if not name or name in state["variants"]:
         return jsonify({"error": "Invalid or duplicate name"}), 400
 
-    base = state["variants"]["base"]
-    clone = json.loads(json.dumps(base))
-
-    state["variants"][name] = clone
+    base_copy = json.loads(json.dumps(state["variants"]["base"]))
+    state["variants"][name] = base_copy
     state["active_variant"] = name
     save_state(state)
 
@@ -151,8 +268,7 @@ def activate_variant():
 
     state["active_variant"] = name
     save_state(state)
-
-    return jsonify({"status": "active variant changed", "active": name})
+    return jsonify({"active": name})
 
 
 @app.route("/api/variants", methods=["GET"])
@@ -164,26 +280,25 @@ def list_variants():
 
 
 # =========================================================
-# VARIANT SCORE (LOCAL SEMANTIC)
+# SCORING
 # =========================================================
 
 @app.route("/api/variant/score", methods=["POST"])
 def score_variant():
     payload = request.get_json()
     job = payload.get("job")
-
     if not isinstance(job, str) or not job.strip():
         return jsonify({"error": "Invalid job description"}), 400
+    job = job.strip()
 
-    active = state["active_variant"]
     base = state["variants"]["base"]
-    variant = state["variants"][active]
+    variant = get_active_resume()
 
     base_score = score_resume(base, job)
     variant_score = score_resume(variant, job)
 
     return jsonify({
-        "variant": active,
+        "variant": state["active_variant"],
         "base_score": base_score,
         "variant_score": variant_score,
         "improvement": variant_score - base_score
@@ -191,171 +306,169 @@ def score_variant():
 
 
 # =========================================================
-# AUTO IMPROVE — SINGLE PASS
+# BULLET IMPACT + DECISIONS
 # =========================================================
 
-@app.route("/api/variant/auto-improve", methods=["POST"])
-def auto_improve_variant():
+@app.route("/api/variant/bullet-impact", methods=["POST"])
+def bullet_impact_api():
     payload = request.get_json()
     job = payload.get("job")
-
     if not isinstance(job, str) or not job.strip():
         return jsonify({"error": "Invalid job description"}), 400
+    job = job.strip()
 
-    active = state["active_variant"]
-    if active == "base":
-        return jsonify({"error": "Cannot auto-improve base variant"}), 403
-
-    variant = state["variants"][active]
-    best_score = score_resume(variant, job)
-    improvements = []
-
-    for exp_i, exp in enumerate(variant.get("experience", [])):
-        for b_i, original in enumerate(exp.get("bullets", [])):
-            rewritten = rewrite_bullet(original, job)
-            exp["bullets"][b_i] = rewritten
-            new_score = score_resume(variant, job)
-
-            if new_score > best_score:
-                best_score = new_score
-                improvements.append({
-                    "experience_index": exp_i,
-                    "bullet_index": b_i,
-                    "old": original,
-                    "new": rewritten,
-                    "score": new_score
-                })
-            else:
-                exp["bullets"][b_i] = original
-
-    save_state(state)
-
+    impacts = bullet_impact_scores(get_active_resume(), job)
     return jsonify({
-        "variant": active,
-        "final_score": best_score,
-        "improvements": improvements
+        "variant": state["active_variant"],
+        "impacts": impacts
     })
 
 
-# =========================================================
-# AUTO IMPROVE — LOOP
-# =========================================================
-
-@app.route("/api/variant/auto-improve/loop", methods=["POST"])
-def auto_improve_loop():
+@app.route("/api/variant/bullet-decisions", methods=["POST"])
+def bullet_decisions_api():
     payload = request.get_json()
     job = payload.get("job")
-    max_iters = payload.get("iterations", 3)
+    if not isinstance(job, str) or not job.strip():
+        return jsonify({"error": "Invalid job description"}), 400
+    job = job.strip()
 
-    if not isinstance(job, str) or not isinstance(max_iters, int):
-        return jsonify({"error": "Invalid input"}), 400
-
-    active = state["active_variant"]
-    if active == "base":
-        return jsonify({"error": "Cannot auto-improve base variant"}), 403
-
-    variant = state["variants"][active]
-    history = []
-    base_score = score_resume(state["variants"]["base"], job)
-    best_score = score_resume(variant, job)
-
-    for iteration in range(max_iters):
-        improved = False
-
-        for exp_i, exp in enumerate(variant.get("experience", [])):
-            for b_i, original in enumerate(exp.get("bullets", [])):
-                rewritten = rewrite_bullet(original, job)
-                exp["bullets"][b_i] = rewritten
-                new_score = score_resume(variant, job)
-
-                if new_score > best_score:
-                    best_score = new_score
-                    improved = True
-                    history.append({
-                        "iteration": iteration + 1,
-                        "experience_index": exp_i,
-                        "bullet_index": b_i,
-                        "old": original,
-                        "new": rewritten,
-                        "score": new_score
-                    })
-                else:
-                    exp["bullets"][b_i] = original
-
-        if not improved:
-            break
-
-    save_state(state)
+    impacts = bullet_impact_scores(get_active_resume(), job)
+    decisions = make_bullet_decisions(impacts)
 
     return jsonify({
-        "variant": active,
-        "base_score": base_score,
-        "final_score": best_score,
-        "iterations_run": len(history),
-        "history": history
+        "variant": state["active_variant"],
+        "decisions": decisions
     })
 
 
+
 # =========================================================
-# AUTO IMPROVE — DIVERSE
+# PHASE 29.1 — DECISION PLAN (DRY RUN)
 # =========================================================
 
-@app.route("/api/variant/auto-improve/diverse", methods=["POST"])
-def auto_improve_diverse():
+@app.route("/api/variant/decision-plan", methods=["POST"])
+def decision_plan_api():
     payload = request.get_json()
     job = payload.get("job")
-    candidates = payload.get("candidates", 3)
+    if not isinstance(job, str) or not job.strip():
+        return jsonify({"error": "Invalid job description"}), 400
+    job = job.strip()
 
-    if not isinstance(job, str) or not isinstance(candidates, int):
-        return jsonify({"error": "Invalid input"}), 400
-
-    active = state["active_variant"]
-    if active == "base":
-        return jsonify({"error": "Cannot auto-improve base variant"}), 403
-
-    variant = state["variants"][active]
-    base_score = score_resume(state["variants"]["base"], job)
-    best_score = score_resume(variant, job)
-    accepted = []
-
-    for exp_i, exp in enumerate(variant.get("experience", [])):
-        for b_i, original in enumerate(exp.get("bullets", [])):
-            best_local = original
-            best_local_score = best_score
-
-            for _ in range(candidates):
-                rewritten = rewrite_bullet(original, job)
-                exp["bullets"][b_i] = rewritten
-                score = score_resume(variant, job)
-
-                if score > best_local_score:
-                    best_local = rewritten
-                    best_local_score = score
-
-            exp["bullets"][b_i] = best_local
-
-            if best_local != original:
-                best_score = best_local_score
-                accepted.append({
-                    "experience_index": exp_i,
-                    "bullet_index": b_i,
-                    "old": original,
-                    "new": best_local,
-                    "score": best_local_score
-                })
-
-    save_state(state)
+    impacts = bullet_impact_scores(get_active_resume(), job)
+    decisions = make_bullet_decisions(impacts)
+    plan = build_execution_plan(decisions)
 
     return jsonify({
-        "variant": active,
-        "base_score": base_score,
-        "final_score": best_score,
-        "accepted": accepted
+        "variant": state["active_variant"],
+        "plan": plan
     })
 
 
 # =========================================================
-# RUN SERVER
+# PHASE 29.4 — PRIORITIZED REVIEW QUEUE
+# =========================================================
+
+@app.route("/api/variant/review-priority", methods=["POST"])
+def review_priority_api():
+    payload = request.get_json()
+    job = payload.get("job")
+    if not isinstance(job, str) or not job.strip():
+        return jsonify({"error": "Invalid job description"}), 400
+    job = job.strip()
+
+    impacts = bullet_impact_scores(get_active_resume(), job)
+    decisions = make_bullet_decisions(impacts)
+
+    review = [d for d in decisions if d["action"] == "REVIEW"]
+
+    if not review:
+        return jsonify({
+            "variant": state["active_variant"],
+            "review_queue": []
+        })
+
+    impacts_only = [d["impact"] for d in review]
+    mean = statistics.mean(impacts_only)
+
+    prioritized = sorted(
+        review,
+        key=lambda d: abs(d["impact"] - mean),
+        reverse=True
+    )
+
+    return jsonify({
+        "variant": state["active_variant"],
+        "review_queue": prioritized
+    })
+
+
+
+@app.route("/api/variant/apply-removals", methods=["POST"])
+def apply_removals_api():
+    guard = ensure_not_base()
+    if guard:
+        return guard
+
+    payload = request.get_json()
+    job = payload.get("job")
+    if not isinstance(job, str) or not job.strip():
+        return jsonify({"error": "Invalid job description"}), 400
+    job = job.strip()
+    confirm = payload.get("confirm", False)
+
+    if confirm is not True:
+        return jsonify({
+            "error": "Confirmation required",
+            "hint": "Set confirm=true to apply removals"
+        }), 400
+
+    resume = get_active_resume()
+    impacts = bullet_impact_scores(resume, job)
+    decisions = make_bullet_decisions(impacts)
+
+    updated = apply_removals(resume, decisions)
+
+    if is_dry_run(payload):
+        return jsonify({
+            "variant": state["active_variant"],
+            "removed": [d for d in decisions if d["action"] == "REMOVE"],
+            "status": "dry-run"
+        })
+
+    state["variants"][state["active_variant"]] = updated
+    save_state(state)
+
+    return jsonify({
+        "variant": state["active_variant"],
+        "removed": [d for d in decisions if d["action"] == "REMOVE"],
+        "status": "applied"
+    })
+
+
+# =========================================================
+# METRICS
+# =========================================================
+
+@app.route("/api/metrics", methods=["GET"])
+def get_metrics():
+    return jsonify(metrics.summary())
+
+
+@app.route("/api/metrics/latest", methods=["GET"])
+def latest_metrics():
+    history = load_metrics()
+    if not history:
+        return jsonify({"error": "No metrics available"}), 404
+    return jsonify(history[-1])
+
+
+@app.route("/api/metrics/aggregate", methods=["GET"])
+def aggregated_metrics():
+    return jsonify(aggregate_metrics())
+
+
+# =========================================================
+# RUN
 # =========================================================
 
 if __name__ == "__main__":
