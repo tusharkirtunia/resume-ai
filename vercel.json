@@ -1,0 +1,11 @@
+{
+  "builds": [
+    {
+      "src": "frontend/resume-ui/package.json",
+      "use": "@vercel/static-build",
+      "config": {
+        "distDir": "frontend/resume-ui/dist"
+      }
+    }
+  ]
+}
