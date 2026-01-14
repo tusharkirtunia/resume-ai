@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.pyc
+.DS_Store
+
+# Frontend env
+frontend/resume-ui/.env
