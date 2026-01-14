@@ -2,6 +2,10 @@ from flask import Flask, jsonify, request
 import json
 import statistics
 
+from flask_cors import CORS
+
+app = Flask(__name__)
+CORS(app)
 from storage import load_state, save_state
 from state import initial_state
 from editor import update_bullet
@@ -14,6 +18,7 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 app = Flask(__name__)
+CORS(app, origins=["http://localhost:5173"])
 metrics = MetricsStore()
 
 # =========================================================
@@ -472,4 +477,5 @@ def aggregated_metrics():
 # =========================================================
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5001, debug=True)
+    port = int(os.environ.get("PORT", 5001))
+    app.run(host="0.0.0.0", port=port)
