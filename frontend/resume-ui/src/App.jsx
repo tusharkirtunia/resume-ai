@@ -1,5 +1,14 @@
+import StatusBar from "./components/StatusBar";
+import LeftPanel from "./components/LeftPanel";
+import RightPanel from "./components/RightPanel";
 import { useEffect, useState } from "react";
-import { getResume, scoreVariant, getBulletImpact, applyRemovals } from "./api";
+import {
+  getResume,
+  scoreVariant,
+  getBulletImpact,
+  applyRemovals,
+  listVariants
+} from "./api";
 
 const FLOW = {
   IDLE: "idle",
@@ -11,138 +20,117 @@ const FLOW = {
   APPLIED: "applied"
 };
 
+const STEP_LABELS = {
+  [FLOW.IDLE]: "Initializing system",
+  [FLOW.VARIANT_SELECTED]: "Step 1 — Review resume & select job",
+  [FLOW.JOB_ENTERED]: "Step 2 — Confirm job description",
+  [FLOW.SCORED]: "Step 3 — Resume scored",
+  [FLOW.REVIEWING]: "Step 4 — Review bullet impact",
+  [FLOW.READY_TO_APPLY]: "Step 5 — Apply decisions",
+  [FLOW.APPLIED]: "Step 6 — Changes applied"
+};
+
+const ALLOWED_TRANSITIONS = {
+  [FLOW.IDLE]: [FLOW.VARIANT_SELECTED],
+  [FLOW.VARIANT_SELECTED]: [FLOW.JOB_ENTERED],
+  [FLOW.JOB_ENTERED]: [FLOW.SCORED],
+  [FLOW.SCORED]: [FLOW.REVIEWING],
+  [FLOW.REVIEWING]: [FLOW.READY_TO_APPLY],
+  [FLOW.READY_TO_APPLY]: [FLOW.APPLIED]
+};
+
+function canTransition(from, to) {
+  return ALLOWED_TRANSITIONS[from]?.includes(to);
+}
+
 function App() {
   const [resume, setResume] = useState(null);
   const [error, setError] = useState(null);
+
   const [flow, setFlow] = useState(FLOW.IDLE);
   const [job, setJob] = useState("");
+  const [jobCollapsed, setJobCollapsed] = useState(false);
   const [score, setScore] = useState(null);
   const [impacts, setImpacts] = useState(null);
 
+  const [backendStatus, setBackendStatus] = useState("checking");
+  const [activeVariant, setActiveVariant] = useState(null);
+  const [lastScoredAt, setLastScoredAt] = useState(null);
+
+  const [loading, setLoading] = useState(false);
+  const [uiError, setUiError] = useState(null);
+  const [successMsg, setSuccessMsg] = useState(null);
+
+  function safeSetFlow(next) {
+    setFlow(prev => (canTransition(prev, next) ? next : prev));
+  }
+
+  const isFinal = flow === FLOW.APPLIED;
+
   useEffect(() => {
+    fetch(import.meta.env.VITE_API_BASE + "/")
+      .then(() => setBackendStatus("online"))
+      .catch(() => setBackendStatus("offline"));
+
     getResume()
       .then(data => {
         setResume(data);
-        setFlow(FLOW.VARIANT_SELECTED);
+        safeSetFlow(FLOW.VARIANT_SELECTED);
       })
       .catch(err => setError(err.message));
+
+    listVariants()
+      .then(v => setActiveVariant(v.active))
+      .catch(() => setActiveVariant("unknown"));
   }, []);
 
   if (error) return <pre>Error: {error}</pre>;
   if (!resume) return <p>Loading…</p>;
 
   return (
-  <div style={{ padding: "2rem" }}>
-    <h1>Resume Decision Engine</h1>
-    <p>Flow state: {flow}</p>
+    <div style={{ minHeight: "100vh", background: "#f7f7f7" }}>
+      
+      <StatusBar
+        backendStatus={backendStatus}
+        activeVariant={activeVariant}
+        lastScoredAt={lastScoredAt}
+      />
 
-    {flow === FLOW.VARIANT_SELECTED && (
-      <>
-        <h2>Current Resume</h2>
-        <pre>{JSON.stringify(resume, null, 2)}</pre>
-
-        <h3>Enter Job Description</h3>
-        <textarea
-          rows={6}
-          style={{ width: "100%" }}
-          value={job}
-          onChange={(e) => setJob(e.target.value)}
-          placeholder="Paste the job description here"
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "1fr 1fr",
+          gap: "2rem",
+          padding: "2rem"
+        }}
+      >
+        <LeftPanel
+          flow={flow}
+          resume={resume}
+          job={job}
+          setJob={setJob}
+          jobCollapsed={jobCollapsed}
+          setJobCollapsed={setJobCollapsed}
+          loading={loading}
+          successMsg={successMsg}
+          STEP_LABELS={STEP_LABELS}
+          FLOW={FLOW}
+          safeSetFlow={safeSetFlow}
+          scoreVariant={scoreVariant}
+          setScore={setScore}
+          setLastScoredAt={setLastScoredAt}
+          applyRemovals={applyRemovals}
+          setLoading={setLoading}
         />
-
-        <br /><br />
-
-        <button
-          disabled={!job.trim()}
-          onClick={() => setFlow(FLOW.JOB_ENTERED)}
-        >
-          Confirm Job
-        </button>
-      </>
-    )}
-
-    {flow === FLOW.JOB_ENTERED && (
-      <>
-        <h2>Job Description</h2>
-        <pre>{job}</pre>
-
-        <button
-          onClick={async () => {
-            const result = await scoreVariant(job);
-            setScore(result);
-            setFlow(FLOW.SCORED);
-          }}
-        >
-          Score Resume
-        </button>
-      </>
-    )}
-
-    {flow === FLOW.SCORED && (
-      <>
-        <h2>Scoring Result</h2>
-        <pre>{JSON.stringify(score, null, 2)}</pre>
-        <button
-          onClick={async () => {
-            const data = await getBulletImpact(job);
-            setImpacts(data.impacts);
-            setFlow(FLOW.REVIEWING);
-          }}
-        >
-          Review Bullet Impact
-        </button>
-      </>
-    )}
-
-    {flow === FLOW.REVIEWING && (
-      <>
-        <h2>Bullet Impact Review</h2>
-        <ul>
-          {impacts.map((b, i) => (
-            <li key={i}>
-              <strong>Impact:</strong> {b.impact.toFixed(3)}<br />
-              <em>{b.bullet}</em>
-            </li>
-          ))}
-        </ul>
-
-        <button onClick={() => setFlow(FLOW.READY_TO_APPLY)}>
-          Continue
-        </button>
-      </>
-    )}
-
-    {flow === FLOW.READY_TO_APPLY && (
-      <>
-        <h2>Apply Bullet Decisions</h2>
-
-        <button
-          onClick={async () => {
-            const result = await applyRemovals(job, { dryRun: true });
-            alert(`Dry run complete. Bullets to remove: ${result.removed.length}`);
-          }}
-        >
-          Dry Run
-        </button>
-
-        <br /><br />
-
-        <button
-          onClick={async () => {
-            await applyRemovals(job, { confirm: true });
-            setFlow(FLOW.APPLIED);
-          }}
-        >
-          Confirm & Apply
-        </button>
-      </>
-    )}
-
-    {flow === FLOW.APPLIED && (
-      <p>Changes applied successfully.</p>
-    )}
-  </div>
-);
+        <RightPanel
+          flow={flow}
+          score={score}
+          impacts={impacts}
+          FLOW={FLOW}
+        />
+      </div>
+    </div>
+  );
 }
 
 export default App;

@@ -1,16 +1,46 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, g
 from flask_cors import CORS
 import json
 import statistics
 import os
 import sys
+import uuid
+import time
+from collections import defaultdict
 
 # ---------------------------------------------------------
 # APP INIT (FIXED: SINGLE INITIALIZATION)
 # ---------------------------------------------------------
 
+ENGINE_VERSION = "1.0.0"
 app = Flask(__name__)
 CORS(app, origins=["http://localhost:5173"])
+
+@app.before_request
+def attach_request_id():
+    g.request_id = str(uuid.uuid4())
+
+@app.before_request
+def rate_limit_guard():
+    ip = request.remote_addr or "unknown"
+    now = time.time()
+
+    window = request_log[ip]
+    window[:] = [t for t in window if now - t < RATE_WINDOW]
+
+    if len(window) >= RATE_LIMIT:
+        return error_response(
+            "RATE_LIMITED",
+            "Too many requests",
+            429
+        )
+
+    window.append(now)
+
+@app.after_request
+def add_request_id_header(response):
+    response.headers["X-Request-ID"] = g.request_id
+    return response
 
 # ---------------------------------------------------------
 # IMPORTS
@@ -25,11 +55,16 @@ from metrics_aggregator import load_metrics, aggregate_metrics
 
 metrics = MetricsStore()
 
+RATE_LIMIT = 60  # requests
+RATE_WINDOW = 60  # seconds
+request_log = defaultdict(list)
+
 # ---------------------------------------------------------
 # CONSTANTS (DEPLOYMENT SAFETY)
 # ---------------------------------------------------------
 
 MAX_BULLETS = 50  # Free-tier safety guard
+MAX_JOB_LENGTH = 2000  # characters
 
 # ---------------------------------------------------------
 # STATE LOAD + FAIL-FAST VALIDATION
@@ -106,11 +141,24 @@ def get_active_resume():
 
 def ensure_not_base():
     if state["active_variant"] == "base":
-        return jsonify({"error": "Base resume is read-only"}), 403
+        return error_response(
+            "BASE_READ_ONLY",
+            "Base resume is read-only",
+            403
+        )
     return None
 
 def is_dry_run(payload):
     return payload.get("dry_run", False) is True
+
+def error_response(code, message, status):
+    return jsonify({
+        "error": {
+            "code": code,
+            "message": message,
+            "request_id": g.request_id
+        }
+    }), status
 
 # ---------------------------------------------------------
 # BULLET DECISION LOGIC
@@ -175,6 +223,13 @@ def home():
 # RESUME
 # ---------------------------------------------------------
 
+@app.route("/api/version", methods=["GET"])
+def api_version():
+    return jsonify({
+        "engine": "resume-decision-engine",
+        "version": ENGINE_VERSION
+    })
+
 @app.route("/api/resume", methods=["GET"])
 def get_resume():
     return jsonify(get_active_resume())
@@ -237,8 +292,13 @@ def create_variant():
 @app.route("/api/variant/activate", methods=["POST"])
 def activate_variant():
     name = request.get_json().get("name")
+   
     if name not in state["variants"]:
-        return jsonify({"error": "Not found"}), 404
+        return error_response(
+            "VARIANT_NOT_FOUND",
+            "Variant not found",
+            404
+        )
 
     state["active_variant"] = name
     save_state(state)
@@ -258,8 +318,12 @@ def list_variants():
 @app.route("/api/variant/score", methods=["POST"])
 def score_variant():
     job = request.get_json().get("job", "").strip()
-    if not job:
-        return jsonify({"error": "Invalid job"}), 400
+    if not job or len(job) > MAX_JOB_LENGTH:
+        return error_response(
+            "INVALID_JOB",
+            "Invalid or oversized job description",
+            400
+        )
 
     base = state["variants"]["base"]
     variant = get_active_resume()
@@ -306,7 +370,11 @@ def apply_removals_api():
     confirm = payload.get("confirm", False)
 
     if not confirm:
-        return jsonify({"error": "confirm=true required"}), 400
+        return error_response(
+            "CONFIRM_REQUIRED",
+            "confirm=true required",
+            400
+        )
 
     resume = get_active_resume()
     guard_resume_size(resume)
